@@ -219,3 +219,66 @@ fmt.Println(quota.Unlimited)   // true if no limit
 Data is encrypted using AES-256-GCM with keys derived via PBKDF2 (100,000 iterations).
 
 **Note:** Metadata (preferences) and entitlements are NOT encrypted. Only use them for non-sensitive information.
+
+## Offline Support
+
+The SDK supports offline-first sync with local caching and automatic retry.
+
+### Basic Usage
+
+```go
+client, err := syncvault.NewOfflineClient(
+    syncvault.Config{
+        AppToken: "your_app_token",
+    },
+    syncvault.OfflineConfig{
+        CacheDir:       "", // defaults to ~/.syncvault/cache
+        RetryInterval:  30 * time.Second,
+        MaxRetries:     10,
+        EnableAutoSync: true,
+    },
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Authenticate
+client.Auth("username", "password")
+
+// Put - queues if offline, syncs when online
+err = client.Put("data.json", myData)
+
+// Get - returns cached data if offline
+err = client.Get("data.json", &myData)
+
+// Check pending operations
+if client.HasPendingChanges() {
+    fmt.Println("Pending:", client.PendingCount())
+}
+```
+
+### Callbacks
+
+```go
+client.OnSyncSuccess(func(op *syncvault.PendingOperation) {
+    fmt.Println("Synced:", op.Path)
+})
+
+client.OnSyncError(func(op *syncvault.PendingOperation, err error) {
+    fmt.Println("Failed:", op.Path, err)
+})
+```
+
+### Manual Sync
+
+```go
+// Manually trigger sync
+client.SyncPending()
+
+// Stop auto-sync
+client.StopAutoSync()
+
+// Clear cache/queue
+client.GetStore().ClearCache()
+client.GetStore().ClearQueue()
+```
