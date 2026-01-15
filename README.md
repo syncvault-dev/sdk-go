@@ -158,30 +158,56 @@ client, err := syncvault.New(syncvault.Config{
 - `List()` - List all files
 - `Delete(path string)` - Delete a file
 
-### Metadata Operations
+### Metadata Operations (Preferences)
 
-Metadata is unencrypted JSON data (up to 10KB) stored on the server. Unlike encrypted sync data, metadata can be read by developers for automation and analytics.
+Metadata is for unencrypted app preferences like theme, timezone, language (up to 10KB).
 
 ```go
-// Set metadata (replaces all)
+// Set preferences (replaces all)
 err := client.SetMetadata(map[string]any{
-    "plan": "premium",
     "theme": "dark",
+    "timezone": "UTC",
+    "language": "en",
 })
 
-// Get metadata
-var meta map[string]any
-err := client.GetMetadata(&meta)
+// Get preferences
+var prefs map[string]any
+err := client.GetMetadata(&prefs)
 
-// Update metadata (shallow merge)
+// Update preferences (shallow merge)
 err := client.UpdateMetadata(map[string]any{
-    "lastSync": time.Now().Format(time.RFC3339),
+    "language": "es",
 })
 ```
 
-- `GetMetadata(result interface{})` - Get user metadata
-- `SetMetadata(metadata interface{})` - Replace all metadata
-- `UpdateMetadata(metadata interface{})` - Merge with existing metadata
+- `GetMetadata(result interface{})` - Get user preferences
+- `SetMetadata(metadata interface{})` - Replace all preferences
+- `UpdateMetadata(metadata interface{})` - Merge with existing preferences
+
+### Entitlements Operations
+
+Entitlements are read-only data set by the developer's backend. Use them for subscription status, feature flags, etc.
+
+```go
+// Get entitlements (set by developer backend)
+var entitlements map[string]any
+err := client.GetEntitlements(&entitlements)
+fmt.Println(entitlements["plan"]) // "premium"
+```
+
+- `GetEntitlements(result interface{})` - Get user entitlements (read-only)
+
+### Quota Operations
+
+```go
+// Get storage quota info
+quota, err := client.GetQuota()
+fmt.Println(quota.UsedBytes)   // bytes used
+fmt.Println(quota.QuotaBytes)  // limit (nil if unlimited)
+fmt.Println(quota.Unlimited)   // true if no limit
+```
+
+- `GetQuota()` - Get user storage quota information
 
 ### State
 
@@ -192,4 +218,4 @@ err := client.UpdateMetadata(map[string]any{
 
 Data is encrypted using AES-256-GCM with keys derived via PBKDF2 (100,000 iterations).
 
-**Note:** Metadata is NOT encrypted and is stored as plain JSON on the server. Only use metadata for non-sensitive information like preferences, feature flags, or sync timestamps.
+**Note:** Metadata (preferences) and entitlements are NOT encrypted. Only use them for non-sensitive information.

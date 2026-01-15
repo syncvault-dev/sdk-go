@@ -278,6 +278,44 @@ func (c *Client) UpdateMetadata(metadata interface{}) error {
 	return c.request("PATCH", "/api/sync/metadata", payload, &response)
 }
 
+// GetEntitlements retrieves entitlements for the current user (read-only, set by developer backend).
+func (c *Client) GetEntitlements(result interface{}) error {
+	if c.token == "" || c.password == "" {
+		return errors.New("not authenticated")
+	}
+
+	var response struct {
+		Entitlements json.RawMessage `json:"entitlements"`
+	}
+
+	if err := c.request("GET", "/api/sync/entitlements", nil, &response); err != nil {
+		return err
+	}
+
+	return json.Unmarshal(response.Entitlements, result)
+}
+
+// QuotaInfo represents user storage quota information.
+type QuotaInfo struct {
+	QuotaBytes *int64 `json:"quotaBytes"`
+	UsedBytes  int64  `json:"usedBytes"`
+	Unlimited  bool   `json:"unlimited"`
+}
+
+// GetQuota retrieves the user's storage quota information.
+func (c *Client) GetQuota() (*QuotaInfo, error) {
+	if c.token == "" || c.password == "" {
+		return nil, errors.New("not authenticated")
+	}
+
+	var response QuotaInfo
+	if err := c.request("GET", "/api/sync/quota", nil, &response); err != nil {
+		return nil, err
+	}
+
+	return &response, nil
+}
+
 // IsAuthenticated checks if the client is authenticated.
 func (c *Client) IsAuthenticated() bool {
 	return c.token != "" && c.password != ""
