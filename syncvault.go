@@ -55,6 +55,22 @@ type FileInfo struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
+// PutOptions contains optional parameters for Put operations.
+type PutOptions struct {
+	// UpdatedAt is used for Last-Write-Wins conflict resolution.
+	// If server has newer data, Put will fail with ErrConflictStale.
+	UpdatedAt *string
+}
+
+// ConflictError is returned when server has newer data (LWW conflict).
+type ConflictError struct {
+	ServerUpdatedAt string
+}
+
+func (e *ConflictError) Error() string {
+	return "conflict: server has newer data"
+}
+
 // New creates a new SyncVault client.
 func New(config Config) (*Client, error) {
 	if config.AppToken == "" {
@@ -176,6 +192,11 @@ func (c *Client) GetToken() string {
 
 // Put stores encrypted data at the given path.
 func (c *Client) Put(path string, data interface{}) error {
+	return c.PutWithOptions(path, data, nil)
+}
+
+// PutWithOptions stores encrypted data at the given path with optional LWW conflict resolution.
+func (c *Client) PutWithOptions(path string, data interface{}, opts *PutOptions) error {
 	if c.token == "" || c.password == "" {
 		return errors.New("not authenticated")
 	}
@@ -188,6 +209,10 @@ func (c *Client) Put(path string, data interface{}) error {
 	payload := map[string]string{
 		"path": path,
 		"data": encrypted,
+	}
+
+	if opts != nil && opts.UpdatedAt != nil {
+		payload["updatedAt"] = *opts.UpdatedAt
 	}
 
 	var response map[string]interface{}
@@ -356,9 +381,19 @@ func (c *Client) request(method, path string, body interface{}, result interface
 
 	if resp.StatusCode >= 400 {
 		var errResp struct {
-			Error string `json:"error"`
+			Error           string `json:"error"`
+			Code            string `json:"code"`
+			ServerUpdatedAt string `json:"serverUpdatedAt"`
 		}
-		json.NewDecoder(resp.Body).Decode(&errResp)
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&errResp); decodeErr != nil {
+			return fmt.Errorf("request failed with status %d", resp.StatusCode)
+		}
+		
+		// Handle LWW conflict
+		if resp.StatusCode == 409 && errResp.Code == "CONFLICT_STALE" {
+			return &ConflictError{ServerUpdatedAt: errResp.ServerUpdatedAt}
+		}
+		
 		if errResp.Error != "" {
 			return errors.New(errResp.Error)
 		}
