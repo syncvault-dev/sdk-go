@@ -6,9 +6,12 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -482,4 +485,253 @@ func (c *Client) decrypt(encryptedBase64 string, result interface{}) error {
 	}
 
 	return json.Unmarshal(plaintext, result)
+}
+
+// ServerClient is the SyncVault SDK client for server-side operations.
+// It allows backend applications to write data on behalf of users.
+type ServerClient struct {
+appToken    string
+secretToken string
+serverURL   string
+httpClient  *http.Client
+}
+
+// NewServerClient creates a new ServerClient.
+func NewServerClient(appToken, secretToken, serverURL string) *ServerClient {
+if serverURL == "" {
+serverURL = defaultServerURL
+}
+return &ServerClient{
+appToken:    appToken,
+secretToken: secretToken,
+serverURL:   serverURL,
+httpClient:  &http.Client{},
+}
+}
+
+func (c *ServerClient) request(method, path string, body interface{}, target interface{}) error {
+var bodyReader io.Reader
+if body != nil {
+jsonBody, err := json.Marshal(body)
+if err != nil {
+return err
+}
+bodyReader = bytes.NewBuffer(jsonBody)
+}
+
+req, err := http.NewRequest(method, c.serverURL+path, bodyReader)
+if err != nil {
+return err
+}
+
+req.Header.Set("Content-Type", "application/json")
+req.Header.Set("X-App-Token", c.appToken)
+req.Header.Set("X-Secret-Token", c.secretToken)
+
+resp, err := c.httpClient.Do(req)
+if err != nil {
+return err
+}
+defer resp.Body.Close()
+
+if resp.StatusCode >= 400 {
+var errResp struct {
+Error string `json:"error"`
+}
+if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+return fmt.Errorf("request failed with status %d", resp.StatusCode)
+}
+return errors.New(errResp.Error)
+}
+
+if target != nil {
+return json.NewDecoder(resp.Body).Decode(target)
+}
+
+return nil
+}
+
+// GetUserPublicKey retrieves the public key for a user.
+func (c *ServerClient) GetUserPublicKey(userID string) (string, error) {
+var resp struct {
+PublicKey string `json:"publicKey"`
+}
+if err := c.request("GET", fmt.Sprintf("/api/server/user/%s/public-key", userID), nil, &resp); err != nil {
+return "", err
+}
+return resp.PublicKey, nil
+}
+
+// PutForUser writes encrypted data to a user's vault.
+func (c *ServerClient) PutForUser(userID, path, encryptedData string) error {
+payload := map[string]string{
+"path": path,
+"data": encryptedData,
+}
+return c.request("POST", fmt.Sprintf("/api/server/user/%s/put", userID), payload, nil)
+}
+
+// ListForUser lists files in a user's vault.
+func (c *ServerClient) ListForUser(userID string) ([]FileInfo, error) {
+var resp struct {
+Files []FileInfo `json:"files"`
+}
+if err := c.request("GET", fmt.Sprintf("/api/server/user/%s/list", userID), nil, &resp); err != nil {
+return nil, err
+}
+return resp.Files, nil
+}
+
+// EncryptForUser encrypts data using hybrid encryption (RSA-OAEP + AES-GCM) for a user.
+func (c *ServerClient) EncryptForUser(data interface{}, publicKeyPEM string) (string, error) {
+// 1. Generate AES key and IV
+aesKey := make([]byte, 32)
+iv := make([]byte, 12)
+if _, err := rand.Read(aesKey); err != nil {
+return "", err
+}
+if _, err := rand.Read(iv); err != nil {
+return "", err
+}
+
+// 2. Serialize data and encrypt with AES-GCM
+jsonData, err := json.Marshal(data)
+if err != nil {
+return "", err
+}
+
+block, err := aes.NewCipher(aesKey)
+if err != nil {
+return "", err
+}
+gcm, err := cipher.NewGCM(block)
+if err != nil {
+return "", err
+}
+
+// Sign data in typical GCM fashion (ciphertext + tag appended)
+ciphertext := gcm.Seal(nil, iv, jsonData, nil)
+
+// Separate tag from ciphertext (Go appends tag at the end)
+tagSize := gcm.Overhead()
+if len(ciphertext) < tagSize {
+return "", errors.New("ciphertext too short")
+}
+rawCiphertext := ciphertext[:len(ciphertext)-tagSize]
+authTag := ciphertext[len(ciphertext)-tagSize:]
+
+// 3. Encrypt AES key with RSA-OAEP
+block2, _ := pem.Decode([]byte(publicKeyPEM))
+if block2 == nil {
+return "", errors.New("failed to parse PEM block containing the public key")
+}
+pub, err := x509.ParsePKIXPublicKey(block2.Bytes)
+if err != nil {
+return "", err
+}
+rsaPub, ok := pub.(*rsa.PublicKey)
+if !ok {
+return "", errors.New("key is not of type *rsa.PublicKey")
+}
+
+encryptedAESKey, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, rsaPub, aesKey, nil)
+if err != nil {
+return "", err
+}
+
+// 4. Pack: encryptedAesKey (256) + iv (12) + authTag (16) + ciphertext
+var combined bytes.Buffer
+combined.Write(encryptedAESKey)
+combined.Write(iv)
+combined.Write(authTag)
+combined.Write(rawCiphertext)
+
+return base64.StdEncoding.EncodeToString(combined.Bytes()), nil
+}
+
+// WriteForUser encrypts and writes data for a user in one step.
+func (c *ServerClient) WriteForUser(userID, path string, data interface{}) error {
+pubKey, err := c.GetUserPublicKey(userID)
+if err != nil {
+return err
+}
+encrypted, err := c.EncryptForUser(data, pubKey)
+if err != nil {
+return err
+}
+return c.PutForUser(userID, path, encrypted)
+}
+
+// DecryptFromServer decrypts data encrypted by ServerClient.
+// privateKeyPEM should be the user's unencrypted private key in PEM format.
+func DecryptFromServer(encryptedBase64, privateKeyPEM string) (interface{}, error) {
+combined, err := base64.StdEncoding.DecodeString(encryptedBase64)
+if err != nil {
+return nil, err
+}
+
+rsaKeySize := 256 // 2048-bit RSA
+aesIvLength := 12
+authTagLength := 16
+minLength := rsaKeySize + aesIvLength + authTagLength
+
+if len(combined) < minLength {
+return nil, errors.New("invalid encrypted data: too short")
+}
+
+encryptedAESKey := combined[:rsaKeySize]
+iv := combined[rsaKeySize : rsaKeySize+aesIvLength]
+authTag := combined[rsaKeySize+aesIvLength : rsaKeySize+aesIvLength+authTagLength]
+ciphertext := combined[rsaKeySize+aesIvLength+authTagLength:]
+
+// Parse Private Key
+block, _ := pem.Decode([]byte(privateKeyPEM))
+if block == nil {
+return nil, errors.New("failed to parse PEM block containing the private key")
+}
+
+// Try parsing as PKCS8 first (standard), then PKCS1
+var privKey interface{}
+privKey, err = x509.ParsePKCS8PrivateKey(block.Bytes)
+if err != nil {
+privKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+if err != nil {
+return nil, fmt.Errorf("failed to parse private key: %v", err)
+}
+}
+
+rsaPriv, ok := privKey.(*rsa.PrivateKey)
+if !ok {
+return nil, errors.New("key is not of type *rsa.PrivateKey")
+}
+
+// Decrypt AES Key
+aesKey, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, rsaPriv, encryptedAESKey, nil)
+if err != nil {
+return nil, fmt.Errorf("failed to decrypt AES key: %v", err)
+}
+
+// Decrypt Data
+blockAES, err := aes.NewCipher(aesKey)
+if err != nil {
+return nil, err
+}
+gcm, err := cipher.NewGCM(blockAES)
+if err != nil {
+return nil, err
+}
+
+// Reassemble ciphertext + tag for Go's Open
+fullCiphertext := append(ciphertext, authTag...)
+plaintext, err := gcm.Open(nil, iv, fullCiphertext, nil)
+if err != nil {
+return nil, fmt.Errorf("failed to decrypt data: %v", err)
+}
+
+var result interface{}
+if err := json.Unmarshal(plaintext, &result); err != nil {
+return nil, err
+}
+
+return result, nil
 }

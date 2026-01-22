@@ -1,5 +1,5 @@
 module github.com/syncvault-dev/sdk-go
 
-go 1.21
+go 1.23
 
-require golang.org/x/crypto v0.21.0
+require golang.org/x/crypto v0.32.0
