@@ -282,3 +282,88 @@ client.StopAutoSync()
 client.GetStore().ClearCache()
 client.GetStore().ClearQueue()
 ```
+
+## Server-Side Write (App Backends)
+
+Apps can write encrypted data on behalf of users using `ServerClient`. This requires:
+1. Developer enables `server_write` in app settings (dev dashboard)
+2. User grants the `server_write` OAuth scope
+
+### How It Works
+
+1. **Developer** enables `serverWriteEnabled` for the app in developer dashboard
+2. User authorizes your app with the `server_write` scope
+3. A RSA key pair is generated **per-app** - public key stored on server, private key stored locally by user
+4. Your backend encrypts data with the user's public key
+5. Only the user can decrypt with their private key
+
+**Important:** The server can **never read** user data. It can only store pre-encrypted blobs.
+
+### Backend Setup
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "time"
+
+    syncvault "github.com/syncvault-dev/sdk-go"
+)
+
+func main() {
+    // Create server client (for backend use only)
+    server, err := syncvault.NewServerClient(syncvault.ServerConfig{
+        AppToken:    "your_app_token",
+        SecretToken: "your_secret_token",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Write data for a user (encrypts automatically)
+    result, err := server.WriteForUser(userID, "inbox/email-123.json", map[string]interface{}{
+        "subject":   "Hello",
+        "body":      "World",
+        "timestamp": time.Now().Unix(),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println("Wrote:", result.Path)
+
+    // Or manually encrypt and write
+    publicKey, _ := server.GetUserPublicKey(userID)
+    encrypted, _ := server.EncryptForUser(data, publicKey)
+    server.PutForUser(userID, "path/to/file.json", encrypted)
+
+    // List user's files (paths only, cannot read content)
+    files, _ := server.ListForUser(userID)
+    for _, f := range files {
+        fmt.Println(f.Path, f.Size)
+    }
+}
+```
+
+### Client-Side Decryption
+
+Users decrypt server-written data using their private key:
+
+```go
+// The private key was stored locally during OAuth consent (per-app)
+privateKey := loadPrivateKeyFromStorage(appToken)
+
+// Get the encrypted data from the server
+// (raw data, not through the normal client.Get which uses password-based decryption)
+
+// Decrypt with private key
+var email map[string]interface{}
+err := syncvault.DecryptFromServer(encryptedData, privateKey, &email)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println("Subject:", email["subject"])
+```
+
+**Note:** If your app hasn't enabled `serverWriteEnabled`, the `server_write` scope will be silently ignored.

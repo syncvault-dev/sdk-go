@@ -6,7 +6,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -479,6 +481,289 @@ func (c *Client) decrypt(encryptedBase64 string, result interface{}) error {
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return err
+	}
+
+	return json.Unmarshal(plaintext, result)
+}
+
+// ServerClient is used by app backends to write data on behalf of users.
+// Requires server_write OAuth scope to be granted by users.
+type ServerClient struct {
+	appToken    string
+	secretToken string
+	serverURL   string
+	httpClient  *http.Client
+}
+
+// ServerConfig holds the configuration for creating a ServerClient.
+type ServerConfig struct {
+	AppToken    string
+	SecretToken string
+	ServerURL   string
+}
+
+// ServerFileInfo represents file metadata from server listing.
+type ServerFileInfo struct {
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+// ServerPutResponse represents the response from a server put operation.
+type ServerPutResponse struct {
+	Success   bool   `json:"success"`
+	Path      string `json:"path"`
+	UserID    string `json:"userId"`
+	Size      int64  `json:"size"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+// NewServerClient creates a new server-side SyncVault client.
+func NewServerClient(config ServerConfig) (*ServerClient, error) {
+	if config.AppToken == "" {
+		return nil, errors.New("appToken is required")
+	}
+	if config.SecretToken == "" {
+		return nil, errors.New("secretToken is required for server-side operations")
+	}
+
+	serverURL := config.ServerURL
+	if serverURL == "" {
+		serverURL = defaultServerURL
+	}
+
+	return &ServerClient{
+		appToken:    config.AppToken,
+		secretToken: config.SecretToken,
+		serverURL:   serverURL,
+		httpClient:  &http.Client{},
+	}, nil
+}
+
+// GetUserPublicKey retrieves the user's public key for encryption.
+func (c *ServerClient) GetUserPublicKey(userID string) (string, error) {
+	var response struct {
+		PublicKey string `json:"publicKey"`
+		UserID    string `json:"userId"`
+	}
+
+	if err := c.request("GET", "/api/server/user/"+userID+"/public-key", nil, &response); err != nil {
+		return "", err
+	}
+
+	return response.PublicKey, nil
+}
+
+// EncryptForUser encrypts data with the user's public key using hybrid encryption.
+// Uses RSA-OAEP to encrypt an AES-GCM key, then encrypts the data with AES-GCM.
+func (c *ServerClient) EncryptForUser(data interface{}, publicKeyBase64 string) (string, error) {
+	// Decode public key
+	publicKeyBytes, err := base64.StdEncoding.DecodeString(publicKeyBase64)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode public key: %w", err)
+	}
+
+	publicKey, err := x509.ParsePKIXPublicKey(publicKeyBytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse public key: %w", err)
+	}
+
+	rsaPublicKey, ok := publicKey.(*rsa.PublicKey)
+	if !ok {
+		return "", errors.New("public key is not RSA")
+	}
+
+	// JSON encode the data
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal data: %w", err)
+	}
+
+	// Generate a random AES key (256-bit)
+	aesKey := make([]byte, 32)
+	if _, err := rand.Read(aesKey); err != nil {
+		return "", fmt.Errorf("failed to generate AES key: %w", err)
+	}
+
+	// Encrypt data with AES-GCM
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	iv := make([]byte, 12)
+	if _, err := rand.Read(iv); err != nil {
+		return "", fmt.Errorf("failed to generate IV: %w", err)
+	}
+
+	encryptedData := gcm.Seal(nil, iv, jsonData, nil)
+
+	// Encrypt AES key with RSA-OAEP
+	encryptedAESKey, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, rsaPublicKey, aesKey, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt AES key: %w", err)
+	}
+
+	// Pack: encryptedAESKey (256 bytes for 2048-bit RSA) + iv (12 bytes) + encryptedData
+	result := make([]byte, 0, len(encryptedAESKey)+len(iv)+len(encryptedData))
+	result = append(result, encryptedAESKey...)
+	result = append(result, iv...)
+	result = append(result, encryptedData...)
+
+	return base64.StdEncoding.EncodeToString(result), nil
+}
+
+// PutForUser writes pre-encrypted data to a user's storage.
+// Data must be encrypted with EncryptForUser() first.
+func (c *ServerClient) PutForUser(userID, path, encryptedData string) (*ServerPutResponse, error) {
+	payload := map[string]string{
+		"path": path,
+		"data": encryptedData,
+	}
+
+	var response ServerPutResponse
+	if err := c.request("POST", "/api/server/user/"+userID+"/put", payload, &response); err != nil {
+		return nil, err
+	}
+
+	return &response, nil
+}
+
+// WriteForUser encrypts and stores data for a user in one call.
+func (c *ServerClient) WriteForUser(userID, path string, data interface{}) (*ServerPutResponse, error) {
+	publicKey, err := c.GetUserPublicKey(userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user public key: %w", err)
+	}
+
+	encrypted, err := c.EncryptForUser(data, publicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt data: %w", err)
+	}
+
+	return c.PutForUser(userID, path, encrypted)
+}
+
+// ListForUser returns all files for a user in this app.
+func (c *ServerClient) ListForUser(userID string) ([]ServerFileInfo, error) {
+	var response struct {
+		Files []ServerFileInfo `json:"files"`
+	}
+
+	if err := c.request("GET", "/api/server/user/"+userID+"/list", nil, &response); err != nil {
+		return nil, err
+	}
+
+	return response.Files, nil
+}
+
+func (c *ServerClient) request(method, path string, body interface{}, result interface{}) error {
+	var bodyReader io.Reader
+	if body != nil {
+		jsonBody, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		bodyReader = bytes.NewReader(jsonBody)
+	}
+
+	req, err := http.NewRequest(method, c.serverURL+path, bodyReader)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-App-Token", c.appToken)
+	req.Header.Set("X-Secret-Token", c.secretToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&errResp); decodeErr != nil {
+			return fmt.Errorf("request failed with status %d", resp.StatusCode)
+		}
+		if errResp.Error != "" {
+			return errors.New(errResp.Error)
+		}
+		return fmt.Errorf("request failed with status %d", resp.StatusCode)
+	}
+
+	if result != nil {
+		return json.NewDecoder(resp.Body).Decode(result)
+	}
+
+	return nil
+}
+
+// DecryptFromServer decrypts data that was encrypted by an app server using hybrid encryption.
+// This is used by the client to decrypt data written via ServerClient.WriteForUser().
+func DecryptFromServer(encryptedBase64, privateKeyBase64 string, result interface{}) error {
+	// Decode the encrypted data
+	combined, err := base64.StdEncoding.DecodeString(encryptedBase64)
+	if err != nil {
+		return fmt.Errorf("failed to decode encrypted data: %w", err)
+	}
+
+	// RSA-OAEP encrypted AES key is 256 bytes for 2048-bit RSA
+	const rsaKeySize = 256
+	const aesIVLength = 12
+
+	if len(combined) < rsaKeySize+aesIVLength {
+		return errors.New("invalid encrypted data: too short")
+	}
+
+	encryptedAESKey := combined[:rsaKeySize]
+	iv := combined[rsaKeySize : rsaKeySize+aesIVLength]
+	ciphertext := combined[rsaKeySize+aesIVLength:]
+
+	// Decode and parse the private key
+	privateKeyBytes, err := base64.StdEncoding.DecodeString(privateKeyBase64)
+	if err != nil {
+		return fmt.Errorf("failed to decode private key: %w", err)
+	}
+
+	privateKey, err := x509.ParsePKCS8PrivateKey(privateKeyBytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	rsaPrivateKey, ok := privateKey.(*rsa.PrivateKey)
+	if !ok {
+		return errors.New("private key is not RSA")
+	}
+
+	// Decrypt the AES key with RSA-OAEP
+	aesKey, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, rsaPrivateKey, encryptedAESKey, nil)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt AES key: %w", err)
+	}
+
+	// Decrypt the data with AES-GCM
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	plaintext, err := gcm.Open(nil, iv, ciphertext, nil)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt data: %w", err)
 	}
 
 	return json.Unmarshal(plaintext, result)
